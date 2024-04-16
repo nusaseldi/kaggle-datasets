@@ -1,0 +1,198 @@
+---
+title: "spaceship-titanic"
+author: "Nusa Seldi"
+format: markdown_github
+editor: visual
+code-fold: true
+code-tools: true
+table-of-contents: true
+---
+
+### Introduction
+
+[Spaceship Titanic](https://www.kaggle.com/competitions/spaceship-titanic/overview) is part of kaggle getting started competitions aims to introduce participants to basic machine learning concepts and facilitate networking within the Kaggle community. In this competition, our job is to predict which passengers are transported to an alternate dimension during the Spaceship Titanic's collision with the spacetime anomaly. To assist in this prediction, we are provided with personal records retrieved from the ship's damaged computer system.
+
+We will build a classification model to predict which passengers are transported using Lightgbm. Lets get started!
+
+### Import Library
+
+```{r}
+#| label: load-packages
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(tidymodels)
+library(bonsai)
+library(vip)
+library(lightgbm)
+```
+
+### Load dataset
+
+```{r}
+#| message: false
+spaceship_train <- read_csv('train.csv')
+spaceship_test <- read_csv('test.csv')
+```
+
+### Check the data
+
+```{r}
+#| echo: TRUE
+spaceship_train |> head(10)
+glimpse(spaceship_train)
+```
+
+### Check missing values
+
+```{r}
+spaceship_train |> summarise_all(~sum(is.na(.))) 
+spaceship_test |> summarise_all(~sum(is.na(.)))
+```
+
+### Data transformation
+
+```{r}
+spaceship_train <-  spaceship_train |> 
+  separate_wider_delim(cols = Cabin, delim = '/', names = c('deck', 'number', 'side')) 
+
+spaceship_test <-  spaceship_test |> 
+  separate_wider_delim(cols = Cabin, delim = '/', names = c('deck', 'number', 'side'))  
+
+spaceship_train <-  spaceship_train |> 
+  mutate(across(c(HomePlanet, CryoSleep, deck, side, Destination, VIP, Transported), as.factor)) |> 
+  mutate(number = as.numeric(number)) |> 
+  select(-Name, -PassengerId)
+
+spaceship_test <-  spaceship_test |> 
+  mutate(across(c(HomePlanet, CryoSleep, deck, side, Destination, VIP), as.factor)) |> 
+  mutate(number = as.numeric(number)) |> 
+  select(-Name)
+
+str(spaceship_train)
+```
+
+### Explore the data
+
+```{r}
+#| warning: false
+
+spaceship_train |> 
+  drop_na(CryoSleep) |> 
+  ggplot(aes(x = CryoSleep, fill = Transported)) +
+  geom_bar(position = "dodge") +
+  scale_fill_brewer(palette = "Paired") 
+
+spaceship_train |> 
+  ggplot(aes(x = VIP, fill = Transported)) +
+  geom_bar(position = "dodge") +
+  scale_fill_brewer(palette = "Paired") 
+
+spaceship_train |> 
+  ggplot(aes(x = HomePlanet, fill = Transported)) +
+  geom_bar(position = "dodge") +
+  scale_fill_brewer(palette = "Paired") 
+
+spaceship_train |> 
+  ggplot(aes(x = Transported,  Age)) +
+  geom_boxplot() +
+  theme_minimal()
+
+spaceship_train |> 
+  ggplot(aes(x = RoomService, y = FoodCourt, color = Transported)) +
+  geom_point(alpha = 0.5) +
+  theme_minimal()
+ 
+spaceship_train |> 
+  ggplot(aes(x = VRDeck, y = Spa, color = Transported)) +
+  geom_point(alpha = 0.5) +
+  theme_minimal()
+```
+
+### Build a model
+
+```{r}
+set.seed(789)
+spaceship_split <- initial_split(spaceship_train, prop = 0.8, strata = Transported)
+train <- training(spaceship_split)
+test <- testing(spaceship_split)
+
+set.seed(777)
+spaceship_fold <- vfold_cv(train, v = 10, strata = Transported)
+
+spaceship_recipe <- recipe(Transported ~ ., data = train) |> 
+  step_impute_knn(CryoSleep) |> 
+  step_impute_median(all_numeric_predictors(), -VRDeck, -Spa) |> 
+  step_impute_linear(VRDeck, Spa, impute_with = imp_vars(RoomService, FoodCourt, ShoppingMall)) |> 
+  step_zv(all_predictors()) 
+  
+bt_spec <- boost_tree(trees = 200, mtry = tune(), min_n = tune(), tree_depth = tune()) |> 
+  set_mode("classification") |> 
+  set_engine("lightgbm")
+
+spaceship_wf <- workflow() |> 
+  add_recipe(spaceship_recipe) |> 
+  add_model(bt_spec)
+
+set.seed(1234)
+doParallel::registerDoParallel()
+bt_fit <- spaceship_wf |> 
+  tune_grid(resamples = spaceship_fold,
+            grid = 5,
+            control = control_resamples(save_pred = TRUE))
+
+```
+
+### Evaluate the model
+
+```{r}
+#| warning: false
+
+collect_metrics(bt_fit)
+
+show_best(bt_fit, metric = "roc_auc")
+
+best_tune <- select_best(bt_fit, metric = 'roc_auc')
+
+final_wf <- finalize_workflow(spaceship_wf, best_tune)
+
+spaceship_final <- final_wf |> 
+  last_fit(spaceship_split)
+
+collect_metrics(spaceship_final)
+
+results <- collect_predictions(spaceship_final)
+
+results |> 
+  conf_mat(truth = Transported, estimate = .pred_class) 
+
+precision(results, truth = Transported, estimate = .pred_class)
+f_meas(results, truth = Transported, estimate = .pred_class)
+
+spaceship_final |> 
+  extract_fit_parsnip() |> 
+  vip(num_features = 8, aesthetics = list(fill = "midnightblue"))
+
+final_wf <- extract_workflow(spaceship_final)
+
+pred <- predict(final_wf, spaceship_test)
+
+pred <-  pred |> 
+  mutate(Transported = case_match(.pred_class, "TRUE" ~ "True",
+            "FALSE" ~ "False")) |> 
+  select(-.pred_class)
+pred
+```
+
+### Export dataset for submission
+
+```{r}
+submission <- spaceship_test |> 
+  select(PassengerId) |> 
+  bind_cols(pred) 
+
+submission
+
+write_csv(submission, file = 'submission-2.csv')
+```
