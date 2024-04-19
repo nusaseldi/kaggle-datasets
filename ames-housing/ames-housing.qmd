@@ -1,0 +1,240 @@
+---
+title: "Ames-Housing"
+author: "Nusa Seldi"
+format: gfm
+editor: visual
+prefer-html: true
+code-fold: true
+---
+
+## Introduction
+
+Hello! Today we will try to participate in another kaggle Getting Started competitions. The challenge in this competition is to predict the final price of each house using the data provided. For this competition, we will build a multilayer perceptron model to complete the challenge. We also gonna tune the parameters to optimize our model.
+
+## Import Library
+
+```{r}
+#| warning: false
+
+pacman::p_load(
+tidyverse,
+tidymodels,
+skimr,
+plotly
+)
+
+```
+
+## Load and inspect the data
+
+There are 1460 observation and 81 variables for training dataset also 1459 observation and 80 variables for test dataset that we got from kaggle. For training dataset consist of 43 categorical data and 38 numeric data.
+
+```{r}
+#| warning: false
+
+  ames_train <- read_csv("train.csv")
+  ames_test <- read_csv("test.csv")
+  
+  dim(ames_train)
+  
+  glimpse(ames_train)
+  
+  skim(ames_train)
+  
+```
+
+## Data Transformation
+
+After we inspect and match with the data description, some columns with missing data actually not really have missing data. For example with the column "Fence", the value "na" in this column does not mean that the value does not exist but it means that there is no "fence" in the house so we can replace the value "na" with "no".
+
+```{r}
+ames_train <- ames_train |>
+  mutate(across(starts_with("Bsmt"), ~ replace_na(., "No")))
+
+ames_train <- ames_train |>
+  rename(GrgYrBlt = GarageYrBlt) |>
+  mutate(across(starts_with("Garage"), ~ replace_na(., "No"))) |>
+  rename(GarageYrBlt = GrgYrBlt)
+
+ames_train <- ames_train |>
+  mutate(across(c(Alley, FireplaceQu, PoolQC, Fence, MiscFeature, MasVnrType), ~ replace_na(., "No")))
+
+ames_train <- ames_train |>
+  mutate(MasVnrArea = replace_na(MasVnrArea, 0))
+
+ames_train <- ames_train |>
+  mutate(across(where(is.character), as.factor))
+
+```
+
+## Explore the data
+
+```{r}
+#| warning: false
+#| message: false
+
+ ggplot(data = ames_train) +
+  geom_histogram(aes(x = SalePrice), bins = 50) +
+  scale_x_log10() 
+
+plot_ly(ames_train, x = ~OverallCond) 
+
+
+plot_ly(ames_train, x = ~BedroomAbvGr, y = ~TotRmsAbvGrd)
+  
+```
+
+## Build a model
+
+```{r}
+
+set.seed(123)
+house_split <- initial_split(ames_train)
+house_train <- training(house_split)
+house_test <- testing(house_split)
+
+set.seed(88)
+house_fold <- vfold_cv(ames_train, v = 10, repeats = 1)
+```
+
+This time, because there are so many features in the dataset, we will try dimensionality reduction using principal component analysis (PCA) and independent component analysis (ICA). We will make three recipes which are basic recipe, pca recipe, and ica recipe.
+
+```{r}
+
+basic_recipe <- recipe(SalePrice ~ . , data = house_train) |> 
+  update_role(Id, new_role = "id") |> 
+  step_impute_knn(all_predictors()) |> 
+  step_zv(all_predictors()) |> 
+  step_normalize(all_numeric_predictors()) |> 
+  step_corr(all_numeric_predictors(), threshold = 0.95) |> 
+  step_dummy(all_nominal_predictors()) 
+
+pca_recipe <- recipe(SalePrice ~ . , data = house_train) |>
+  update_role(Id, new_role = "id") |> 
+  step_impute_knn(all_predictors()) |> 
+  step_zv(all_predictors()) |> 
+  step_normalize(all_numeric_predictors()) |> 
+  step_corr(all_numeric_predictors(), threshold = 0.95) |> 
+  step_dummy(all_nominal_predictors()) |> 
+  step_pca(all_predictors(), num_comp = 8) 
+
+prep_pca <- prep(pca_recipe) 
+ 
+baked_pca <- bake(prep_pca, new_data = NULL)
+
+head(baked_pca)
+
+ica_recipe <- recipe(SalePrice ~ . , data = house_train) |>
+  update_role(Id, new_role = "id") |> 
+  step_impute_knn(all_predictors()) |> 
+  step_zv(all_predictors()) |> 
+  step_normalize(all_numeric_predictors()) |> 
+  step_corr(all_numeric_predictors(), threshold = 0.95) |> 
+  step_dummy(all_nominal_predictors()) |> 
+  step_ica(all_predictors() , num_comp = 8)
+
+prep_ica <- prep(ica_recipe) 
+
+baked_ica <- bake(prep_ica, new_data = NULL)
+
+head(baked_ica)
+```
+
+```{r}
+
+baked_pca |> 
+  ggplot(aes(x = PC1, y = PC2)) +
+  geom_point()
+
+baked_ica |> 
+  ggplot(aes(x = IC1, y = IC2)) +
+  geom_point()
+```
+
+For the model, we will build a single layer neural network and we also gonna tune the paramater for hidden units, penalty, epochs, and learn rate.
+
+```{r}
+doParallel::registerDoParallel()
+mlp_model <- mlp(hidden_units = tune(), penalty = tune(), epochs = tune(), learn_rate = tune()) |> 
+  set_mode("regression") |> 
+  set_engine("brulee")
+
+house_wf <- workflow_set(preproc = list(pca = pca_recipe, ica = ica_recipe, basic = basic_recipe), models = list(mlp_model))
+
+house_res <- workflow_map(house_wf, 
+                          resamples = house_fold,
+                          seed = 999,
+                          grid = 5, 
+                          control = control_grid(parallel_over = "everything", save_pred = TRUE))
+
+```
+
+## Evaluate the model
+
+```{r}
+
+collect_metrics(house_res) 
+
+house_res |> 
+  rank_results() |> 
+  filter(.metric == 'rmse')
+
+autoplot(house_res, rank_metric = 'rmse',  metric = 'rmse' , select_best = TRUE, type = 'wflow_id' )
+
+```
+
+The results actually show that the basic recipe without using the dimension reduction have a better performance, but for this time we will use the pca because the results are close to basic recipe.
+
+```{r}
+
+best_tune <- house_res |> 
+  extract_workflow_set_result(id = 'pca_mlp') |> 
+  select_best(metric = 'rmse')
+
+best_tune
+
+final_model <- house_res |> 
+  extract_workflow('pca_mlp') |> 
+  finalize_workflow(best_tune) |> 
+  last_fit(split = house_split)
+
+collect_metrics(final_model)
+
+```
+
+```{r}
+
+results <-  final_model |> 
+  collect_predictions() |> 
+  select(.pred, SalePrice)
+
+results
+
+results |> 
+  ggplot(aes(x = SalePrice, y = .pred)) +
+  geom_point() +
+  geom_abline(lty = 2) +
+  coord_obs_pred()
+```
+
+## Predict test set and import the results
+
+```{r}
+
+pred <- extract_workflow(final_model) |> 
+  predict(ames_test)
+
+pred
+
+submission <- ames_test |> 
+  select(Id) |> 
+  bind_cols(pred) |> 
+  rename(SalePrice = .pred)
+
+submission
+```
+
+```{r}
+
+write_csv(submission, "submission.csv")
+```
